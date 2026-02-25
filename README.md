@@ -27,6 +27,36 @@
     all WS clients
 ```
 
+
+
+---
+
+## Data Flow & Request Architecture
+
+![Connection Flow Diagram](diagram.png)
+
+### 🔄 Real-time Update Flow
+
+```
+TransactionService
+    ↓ IHubContext.Clients.All.SendAsync()
+SignalR Hub
+    ↓ ReceiveTransaction event
+All Connected Clients
+```
+
+### Multi-Pod Synchronization (with Redis)
+
+```
+Pod A                    Pod B                    Pod C
+    ↓                        ↓                        ↓
+Transaction → Redis ← Transaction ← Redis ← Transaction
+    ↓                        ↓                        ↓
+SignalR Broadcast    SignalR Broadcast    SignalR Broadcast
+    ↓                        ↓                        ↓
+Clients A              Clients B              Clients C
+```
+
 ---
 
 ## Quick Start
