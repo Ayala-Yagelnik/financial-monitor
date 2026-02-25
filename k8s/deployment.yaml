@@ -1,0 +1,84 @@
+# ═══════════════════════════════════════════════════════
+# Financial Monitor — 3 Pods
+# All pods connect to same PostgreSQL and Redis
+# ═══════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: financial-monitor
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: financial-monitor
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # Zero downtime
+  template:
+    metadata:
+      labels:
+        app: financial-monitor
+    spec:
+      containers:
+        - name: financial-monitor
+          image: financial-monitor:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            # PostgreSQL — all pods connect to same DB
+            - name: DATABASE_PROVIDER
+              value: "postgres"
+            - name: ConnectionStrings__PostgreSQL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: postgres-connection
+
+            # Redis — WebSocket sync
+            - name: Redis__ConnectionString
+              value: "redis-service:6379"
+
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+      # Distribute pods across nodes — HA
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - financial-monitor
+                topologyKey: kubernetes.io/hostname

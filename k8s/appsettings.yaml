@@ -1,0 +1,15 @@
+# ConfigMap — application settings
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  appsettings.Production.json: |
+    {
+      "Logging": {
+        "LogLevel": {
+          "Default": "Warning",
+          "Microsoft.AspNetCore": "Warning"
+        }
+      }
+    }

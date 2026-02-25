@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: financial-monitor-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: financial-monitor
+  ports:
+    - port: 80
+      targetPort: 8080
+  # SessionAffinity — WebSocket requires same pod
+  # With Redis Pub/Sub you can remove this and enable true load balancing
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
