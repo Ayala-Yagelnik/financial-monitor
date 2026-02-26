@@ -15,19 +15,19 @@ public class RedisSubscriberService : BackgroundService
 {
     private readonly IConnectionMultiplexer _redis;
     private readonly IHubContext<TransactionHub> _hubContext;
-    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ITransactionCacheUpdater _cacheUpdater;
     private readonly ILogger<RedisSubscriberService> _logger;
     private const string Channel = "transactions";
 
     public RedisSubscriberService(
         IConnectionMultiplexer redis,
         IHubContext<TransactionHub> hubContext,
-        IServiceScopeFactory scopeFactory,
+        ITransactionCacheUpdater cacheUpdater,
         ILogger<RedisSubscriberService> logger)
     {
         _redis = redis;
         _hubContext = hubContext;
-        _scopeFactory = scopeFactory;
+        _cacheUpdater = cacheUpdater;
         _logger = logger;
     }
 
@@ -49,9 +49,7 @@ public class RedisSubscriberService : BackgroundService
                             if (transaction == null) return;
 
                             // Update local cache
-                            using var scope = _scopeFactory.CreateScope();
-                            var service = scope.ServiceProvider.GetRequiredService<ITransactionService>();
-                            await service.UpsertTransactionAsync(transaction);
+                            _cacheUpdater.UpdateCache(transaction);
 
                             // Broadcast to WebSocket clients
                             await _hubContext.Clients.All.SendAsync(

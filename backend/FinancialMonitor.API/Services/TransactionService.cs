@@ -27,13 +27,18 @@ public interface ITransactionService
     Task<IReadOnlyList<Transaction>> GetByStatusAsync(TransactionStatus status);
 }
 
+public interface ITransactionCacheUpdater
+{
+    void UpdateCache(Transaction transaction);
+}
+
 /// <summary>
 /// SQLite/PostgreSQL implementation with in-memory cache.
 ///
 /// Cache: Accelerates common calls (stats, recent transactions)
 /// DB:    Source of truth — all data, full pagination
 /// </summary>
-public class SqliteTransactionService : ITransactionService
+public class SqliteTransactionService : ITransactionService, ITransactionCacheUpdater
 {
     private readonly IDbContextFactory<AppDbContext> _dbFactory;
     private readonly ConcurrentDictionary<string, Transaction> _cache = new();
@@ -87,6 +92,14 @@ public class SqliteTransactionService : ITransactionService
             (_, old) => transaction.Timestamp > old.Timestamp ? transaction : old);
 
         return (isNew, null);
+    }
+
+    public void UpdateCache(Transaction transaction)
+    {
+        _cache.AddOrUpdate(
+            transaction.TransactionId,
+            transaction,
+            (_, old) => transaction.Timestamp > old.Timestamp ? transaction : old);
     }
 
     /// <summary>
@@ -183,7 +196,7 @@ public class SqliteTransactionService : ITransactionService
     }
 }
 
-public class InMemoryTransactionService : ITransactionService
+public class InMemoryTransactionService : ITransactionService, ITransactionCacheUpdater
 {
     private readonly ConcurrentDictionary<string, Transaction> _transactions = new();
 
@@ -203,6 +216,14 @@ public class InMemoryTransactionService : ITransactionService
             (_, old) => transaction.Timestamp > old.Timestamp ? transaction : old);
 
         return Task.FromResult<(bool, string?)>((isNew, null));
+    }
+
+    public void UpdateCache(Transaction transaction)
+    {
+        _transactions.AddOrUpdate(
+            transaction.TransactionId,
+            transaction,
+            (_, old) => transaction.Timestamp > old.Timestamp ? transaction : old);
     }
 
     public Task<(IReadOnlyList<Transaction> Items, int TotalCount)> GetPagedAsync(

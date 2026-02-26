@@ -82,6 +82,8 @@ else
 // SERVICES
 // ═══════════════════════════════════════════════════════
 builder.Services.AddSingleton<ITransactionService, SqliteTransactionService>();
+builder.Services.AddSingleton<ITransactionCacheUpdater>(sp =>
+    (ITransactionCacheUpdater)sp.GetRequiredService<ITransactionService>());
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddCors(o =>
