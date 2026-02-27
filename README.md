@@ -16,6 +16,9 @@ cd frontend; npm install; npm run dev
 # Production (PostgreSQL + Redis, all containerized)
 cp .env.example .env   # fill in POSTGRES_PASSWORD
 docker compose up -d
+
+# Kubernetes deployment
+kubectl apply -f k8s/
 ```
 
 ---

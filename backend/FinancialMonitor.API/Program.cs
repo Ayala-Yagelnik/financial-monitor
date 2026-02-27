@@ -107,9 +107,12 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 // ─── CORS ───────────────────────────────────────────────────────────────────
+var allowedOrigins = builder.Configuration["CORS:AllowedOrigins"]?.Split(',') ?? 
+    ["http://localhost:5173", "http://localhost:3000"];
+
 builder.Services.AddCors(o =>
     o.AddPolicy("AllowFrontend", p =>
-        p.WithOrigins("http://localhost:5173", "http://localhost:3000")
+        p.WithOrigins(allowedOrigins)
          .AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
 var app = builder.Build();
@@ -129,7 +132,7 @@ app.UseAuthorization();
 // ─── ENDPOINTS ──────────────────────────────────────────────────────────────
 app.MapTransactionsApi();
 app.MapHub<TransactionHub>("/hubs/transactions");
-app.MapGet("/health", () => Results.Ok(new { status = "healthy", database = dbProvider, redis = hasRedis }));
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }));
 
 app.Run();
 
