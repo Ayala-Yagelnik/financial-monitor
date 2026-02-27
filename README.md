@@ -1,238 +1,164 @@
-# 🏦 Real-Time Financial Monitor
+# Financial Monitor
 
-## Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   React Frontend                     │
-│  /add (Simulator)         /monitor (Live Dashboard)  │
-│        │                          │                  │
-│   HTTP POST                  SignalR WS              │
-└────────┼──────────────────────────┼─────────────────┘
-         │                          │
-         ▼                          │
-┌─────────────────┐                 │
-│  .NET 9 API     │─────────────────┘
-│                 │
-│  POST /api/     │──► UpsertTransactionAsync
-│  transactions   │         │
-│                 │    Timestamp Guard
-│  SignalR Hub    │    Timestamp Guard
-│    (old doesn't overwrite new)
-└────────┬────────┘         │
-         │              ConcurrentDictionary
-         │              (MVP - in-memory)
-         │
-    Broadcast to
-    all WS clients
-```
-
-
-
----
-
-## Data Flow & Request Architecture
-
-![Connection Flow Diagram](diagram.png)
-
-### 🔄 Real-time Update Flow
-
-```
-TransactionService
-    ↓ IHubContext.Clients.All.SendAsync()
-SignalR Hub
-    ↓ ReceiveTransaction event
-All Connected Clients
-```
-
-### Multi-Pod Synchronization (with Redis)
-
-```
-Pod A                    Pod B                    Pod C
-    ↓                        ↓                        ↓
-Transaction → Redis ← Transaction ← Redis ← Transaction
-    ↓                        ↓                        ↓
-SignalR Broadcast    SignalR Broadcast    SignalR Broadcast
-    ↓                        ↓                        ↓
-Clients A              Clients B              Clients C
-```
+Real-Time Financial Transaction Monitor — .NET 9 backend, React + TypeScript frontend.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Backend
-cd backend/FinancialMonitor.API && dotnet run
+# Development (SQLite + no Redis)
+cd backend; dotnet run --project FinancialMonitor.API
 
 # Frontend
-cd frontend && npm install && npm run dev
+cd frontend; npm install; npm run dev
 
-# Tests
-cd backend/FinancialMonitor.Tests && dotnet test
+# Production (PostgreSQL + Redis, all containerized)
+cp .env.example .env   # fill in POSTGRES_PASSWORD
+docker compose up -d
 ```
 
 ---
 
-## Upsert Logic & Timestamp Guard
-
-Every POST is **upsert by UUID**:
-
-| State | Result | HTTP |
-|-----|--------|------|
-| UUID new | adds | 201 Created |
-| UUID exists + newer Timestamp | updates | 200 OK |
-| UUID exists + **older** Timestamp | **ignored** | 200 OK |
+## Architecture Overview
 
 ```
-Pod A receives: { id: "abc", status: Completed, timestamp: 10:00:01 }
-Pod B receives: { id: "abc", status: Pending,   timestamp: 09:59:55 }  ← arrived late
-
-Result: Completed saved ✅
+┌─────────────────┐     HTTP POST      ┌──────────────────────────┐
+│  /add  (React)  │ ─────────────────► │  POST /api/transactions  │
+└─────────────────┘                    │                          │
+                                       │   EfTransactionService   │
+┌─────────────────┐    WebSocket       │   (PostgreSQL / SQLite)  │
+│/monitor (React) │ ◄───────────────── │                          │
+│  Redux Store    │    SignalR Hub     │   SignalR + Redis        │
+└─────────────────┘                    │   Backplane              │
+                                       └──────────────────────────┘
 ```
 
 ---
 
-## ADR: Scalability — What's missing in MVP and how to solve
+## ADR — Architecture Decision Records
 
-### Problem 1: In-Memory Storage
+### ADR-001: SignalR Redis Backplane for Distributed Real-Time
 
-**Current state (MVP):**
-Data saved in `ConcurrentDictionary` in memory.
+**Status:** Implemented
+
+**Context:**
+When deployed to multiple pods (K8S replicas), a SignalR Hub only knows about clients
+connected to its own pod. A transaction arriving at Pod B is invisible to clients on Pod A.
+
+**Decision:**
+Use SignalR's built-in Redis Backplane (`AddStackExchangeRedis`).
+
+When any pod calls `hubContext.Clients.All.SendAsync(...)`, SignalR internally:
+1. Publishes the message to a Redis channel
+2. All other pods receive it via their Redis subscription
+3. Each pod forwards the message to its own WebSocket clients
 
 ```
-❌ Pod falls → all data disappears
-❌ 5 Pods → each pod has separate memory
-❌ Restart → complete reset
+POST → Pod B
+  Pod B → hubContext.Clients.All.SendAsync(tx)
+    → SignalR publishes to Redis channel
+      → Pod A receives from Redis → sends to its clients ✓
+      → Pod C receives from Redis → sends to its clients ✓
+      → Pod B sends to its own clients ✓
 ```
 
-**Production solution:**
+**Why not manual Pub/Sub?**
+A previous version implemented Redis Pub/Sub manually (RedisSubscriberService).
+This was removed in favor of the built-in backplane — less code, no custom
+reconnection logic, same result, maintained by Microsoft.
 
-```
-Stage 1 — SQLite (single pod):
-  ITransactionService → SqliteTransactionService
-  Entity Framework Core + migrations
-  Already defined as interface — easy replacement!
-
-Stage 2 — PostgreSQL (multi pod):
-  All pods write to same DB
-  Connection pooling (PgBouncer)
-  
-Stage 3 — Read/Write separation:
-  Write → Primary DB
-  Read  → Read Replica
-```
-
-**Why SQLite first?**
-This is a 20-line change because we have `ITransactionService`.
-PostgreSQL requires infra — SQLite is enough to test the logic.
+**Fallback:**
+If Redis is unavailable or not configured, the system falls back to
+LocalBroadcastService (single-pod mode via in-process Channel).
 
 ---
 
-### Problem 2: Distributed WebSocket (the classic problem)
+### ADR-002: EF Core Provider Abstraction
 
-```
-5 Pods in Kubernetes:
+**Status:** Implemented
 
-Client A ←─ WebSocket ─→ Pod 1
-Client B ←─ WebSocket ─→ Pod 3
+**Context:**
+Development needs zero-setup (SQLite). Production needs a shared, scalable DB (PostgreSQL).
 
-Transaction arrives to Pod 2:
-  ✅ Client connected to Pod 2 gets update
-  ❌ Client A and B get nothing
-```
+**Decision:**
+EfTransactionService depends on IDbContextFactory<AppDbContext> — it has no
+knowledge of which DB engine is used. The provider is configured once in Program.cs
+based on the DATABASE_PROVIDER environment variable.
 
-**The solution: Redis Pub/Sub**
-
-```
-Pod 1 ◄── subscribe ──┐
-Pod 2 ── publish ─────┤ Redis Channel: "transactions"
-Pod 3 ◄── subscribe ──┘
-
-Flow:
-1. Transaction arrives to Pod 2
-2. Pod 2 saves in DB
-3. Pod 2 publishes to Redis
-4. All pods (including Pod 2) receive from Redis
-5. Each pod broadcasts to its clients via SignalR
-```
-
-**Implementation:**
-```csharp
-// Program.cs
-builder.Services.AddStackExchangeRedisCache(o =>
-    o.Configuration = config["Redis:ConnectionString"]);
-
-// RedisTransactionPublisher — publish after upsert
-await _redis.PublishAsync("transactions", JsonSerializer.Serialize(tx));
-
-// RedisTransactionSubscriber (BackgroundService) — subscribe and broadcast
-_redis.Subscribe("transactions", async (_, msg) => {
-    var tx = JsonSerializer.Deserialize<Transaction>(msg);
-    await _hubContext.Clients.All.SendAsync("ReceiveTransaction", tx);
-});
-```
-
-**Timestamp Guard with Redis:**
-The problem: old message from Pod 3 can arrive after new message from Pod 1.
-The solution: already exists in `UpsertTransactionAsync` — the timestamp protects.
+This avoids a separate PostgresTransactionService, which would be code duplication.
 
 ---
 
-### Problem 3: Out-of-Order Messages
+### ADR-003: Minimal API over MVC Controllers
+
+**Status:** Implemented
+
+**Context:**
+Classic [ApiController] produces less accurate OpenAPI schemas (IActionResult
+doesn't describe response types) and adds MVC middleware overhead.
+
+**Decision:**
+Use ASP.NET Minimal API with strongly-typed return types:
+
+  Task<Results<Created<Transaction>, Ok<Transaction>, BadRequest<object>>>
+
+OpenAPI automatically generates accurate schemas per response code.
+Handlers are plain functions — easier to test without the MVC pipeline.
+
+---
+
+### ADR-004: Redux Toolkit for Frontend State
+
+**Status:** Implemented
+
+**Context:**
+The original implementation mixed SignalR lifecycle, HTTP calls, and UI state
+inside a single useTransactionHub hook.
+
+**Decision:**
+- TransactionHubService — owns SignalR lifecycle + HTTP, dispatches Redux actions
+- Redux transactionSlice — single source of truth for all state
+- Components — read via useSelector, never touch the network directly
+
+---
+
+## Project Structure
 
 ```
-What happens when 5 pods send messages in parallel?
+backend/
+  FinancialMonitor.API/
+    Apis/           Minimal API endpoint registration
+    DTOs/           Request/Response records (immutable)
+    Data/           EF Core DbContext
+    Hubs/           SignalR Hub
+    Interfaces/     ITransactionService, ITransactionPublisher, ITransactionCacheUpdater
+    Messaging/      RedisPublisher, NoOpPublisher, LocalBroadcastService (fallback)
+    Models/         Transaction entity
+    Services/       EfTransactionService (prod), InMemoryTransactionService (tests)
+  FinancialMonitor.Tests/
+    TransactionServiceTests.cs   Unit tests (no DB required)
 
-Pod 1: { status: Pending,   timestamp: T+0 }
-Pod 3: { status: Completed, timestamp: T+2 }  ← arrives first
-Pod 2: { status: Pending,   timestamp: T+0 }  ← arrives second (older!)
+frontend/
+  src/
+    components/     ConnectionBadge, TransactionRow, StatsBar, Pagination
+    hooks/          useTransactionHub (service lifecycle)
+    pages/          Monitor, AddTransaction
+    services/       TransactionHubService (SignalR + HTTP)
+    store/          Redux slice + selectors
+    types/          Transaction, TransactionStatus
 
-Our solution:
-AddOrUpdate checks timestamp before replacement.
-Old doesn't overwrite new. ✅
+k8s/               Kubernetes manifests
+docker-compose.yml Production compose (PostgreSQL + Redis + Nginx)
 ```
 
 ---
 
-### Comparison of Pub/Sub Solutions
+## Environment Variables
 
-| Solution | Advantage | Disadvantage | Suitable for |
-|---------|-----------|-------------|-------------|
-| **Redis Pub/Sub** ✅ | Simple, fast, <1ms latency | Not persistent | MVP → Production |
-| **Redis Streams** | persistent, replay | More complex | If need audit log |
-| **Kafka** | Durable, replay, partitions | Over-engineering | Millions events/sec |
-| **RabbitMQ** | Complex routing | Ops overhead | Complex microservices |
-| **Azure Service Bus** | Fully managed | Vendor lock-in, cost | Azure-native |
-| **SignalR Azure** | Managed scaling | Azure dependency | Azure-only |
-
-**Recommendation:** Redis Pub/Sub for this project. Simple, fast, easy to add to Kubernetes as sidecar.
-
----
-
-## Thread Safety
-
-### Backend
-- `ConcurrentDictionary.AddOrUpdate` — atomic, no manual lock
-- Timestamp comparison inside update delegate — atomic
-- SignalR `IHubContext` — thread-safe Singleton
-
-### Frontend
-- `useMemo` — filter calculated only when data changes
-- Limit 500 transactions — prevents memory leak
-- WebSocket with auto-reconnect
-
----
-
-## Kubernetes
-
-```bash
-kubectl apply -f k8s/
-kubectl get pods
-kubectl logs deployment/financial-monitor
-```
-
-**Session Affinity** — essential for WebSocket: ensures each client always reaches same pod.
-
-**Note:** With Redis Pub/Sub you can remove SessionAffinity and allow true load balancing.
-
+| Variable | Default | Description |
+|---|---|---|
+| DATABASE_PROVIDER | sqlite | Set to postgres for PostgreSQL |
+| ConnectionStrings__PostgreSQL | — | PostgreSQL connection string |
+| Redis__ConnectionString | — | Redis host e.g. redis:6379 |
+| ASPNETCORE_ENVIRONMENT | Development | Set to Production in containers |

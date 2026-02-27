@@ -1,84 +1,55 @@
-# ═══════════════════════════════════════════════════════
-# Financial Monitor — 3 Pods
-# All pods connect to same PostgreSQL and Redis
-# ═══════════════════════════════════════════════════════
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: financial-monitor
+  name: financial-monitor-backend
+  labels:
+    app: financial-monitor-backend
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: financial-monitor
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0   # Zero downtime
+      app: financial-monitor-backend
   template:
     metadata:
       labels:
-        app: financial-monitor
+        app: financial-monitor-backend
     spec:
       containers:
-        - name: financial-monitor
-          image: financial-monitor:latest
-          imagePullPolicy: IfNotPresent
+        - name: backend
+          image: financial-monitor-backend:latest
           ports:
             - containerPort: 8080
           env:
-            # PostgreSQL — all pods connect to same DB
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
             - name: DATABASE_PROVIDER
               value: "postgres"
             - name: ConnectionStrings__PostgreSQL
               valueFrom:
                 secretKeyRef:
-                  name: app-secrets
-                  key: postgres-connection
-
-            # Redis — WebSocket sync
+                  name: financial-monitor-secrets
+                  key: postgres-connection-string
             - name: Redis__ConnectionString
-              value: "redis-service:6379"
-
-            - name: ASPNETCORE_URLS
-              value: "http://+:8080"
-            - name: ASPNETCORE_ENVIRONMENT
-              value: "Production"
-
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "256Mi"
-              cpu: "500m"
-
-          # Health checks
+              valueFrom:
+                secretKeyRef:
+                  name: financial-monitor-secrets
+                  key: redis-connection-string
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
-
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 5
-
-      # Distribute pods across nodes — HA
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchExpressions:
-                    - key: app
-                      operator: In
-                      values:
-                        - financial-monitor
-                topologyKey: kubernetes.io/hostname
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"

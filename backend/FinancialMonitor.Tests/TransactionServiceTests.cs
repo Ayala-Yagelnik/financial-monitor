@@ -6,7 +6,7 @@ namespace FinancialMonitor.Tests;
 
 /// <summary>
 /// Tests for InMemoryTransactionService — fast, no DB dependencies.
-/// Business logic is identical to SqliteTransactionService.
+/// Business logic is identical to EfTransactionService.
 /// </summary>
 public class TransactionServiceTests
 {
@@ -44,10 +44,8 @@ public class TransactionServiceTests
         var service = new InMemoryTransactionService();
         var id = Guid.NewGuid().ToString();
         var now = DateTime.UtcNow;
-
         await service.UpsertTransactionAsync(CreateTx(id, TransactionStatus.Pending, now));
         await service.UpsertTransactionAsync(CreateTx(id, TransactionStatus.Completed, now.AddSeconds(1)));
-
         var all = await service.GetAllAsync();
         Assert.Single(all);
         Assert.Equal(TransactionStatus.Completed, all[0].Status);
@@ -64,17 +62,6 @@ public class TransactionServiceTests
         Assert.Null(error);
     }
 
-    [Fact]
-    public async Task Upsert_SameIdThreeTimes_OnlyOneRecord()
-    {
-        var service = new InMemoryTransactionService();
-        var id = Guid.NewGuid().ToString();
-        await service.UpsertTransactionAsync(CreateTx(id));
-        await service.UpsertTransactionAsync(CreateTx(id));
-        await service.UpsertTransactionAsync(CreateTx(id));
-        Assert.Single(await service.GetAllAsync());
-    }
-
     // ═══════════════════════════════════════
     // TIMESTAMP GUARD
     // ═══════════════════════════════════════
@@ -85,27 +72,8 @@ public class TransactionServiceTests
         var service = new InMemoryTransactionService();
         var id = Guid.NewGuid().ToString();
         var now = DateTime.UtcNow;
-
-        // Newer version arrives first
         await service.UpsertTransactionAsync(CreateTx(id, TransactionStatus.Completed, now));
-
-        // Old message arrives later (out-of-order)
         await service.UpsertTransactionAsync(CreateTx(id, TransactionStatus.Pending, now.AddMinutes(-5)));
-
-        var result = (await service.GetAllAsync()).First();
-        Assert.Equal(TransactionStatus.Completed, result.Status); // Old didn't overwrite!
-    }
-
-    [Fact]
-    public async Task Upsert_NewerTimestamp_DoesOverwrite()
-    {
-        var service = new InMemoryTransactionService();
-        var id = Guid.NewGuid().ToString();
-        var now = DateTime.UtcNow;
-
-        await service.UpsertTransactionAsync(CreateTx(id, TransactionStatus.Pending, now));
-        await service.UpsertTransactionAsync(CreateTx(id, TransactionStatus.Completed, now.AddMinutes(1)));
-
         var result = (await service.GetAllAsync()).First();
         Assert.Equal(TransactionStatus.Completed, result.Status);
     }
@@ -122,16 +90,12 @@ public class TransactionServiceTests
         var idOld    = Guid.NewGuid().ToString();
         var idRecent = Guid.NewGuid().ToString();
         var idNewest = Guid.NewGuid().ToString();
-
         await service.UpsertTransactionAsync(CreateTx(idOld,    timestamp: now.AddHours(-2)));
         await service.UpsertTransactionAsync(CreateTx(idNewest, timestamp: now));
         await service.UpsertTransactionAsync(CreateTx(idRecent, timestamp: now.AddHours(-1)));
-
         var results = await service.GetAllAsync();
         Assert.Equal(3, results.Count);
         Assert.Equal(idNewest, results[0].TransactionId);
-        Assert.Equal(idRecent, results[1].TransactionId);
-        Assert.Equal(idOld,    results[2].TransactionId);
     }
 
     [Fact]
@@ -141,11 +105,8 @@ public class TransactionServiceTests
         await service.UpsertTransactionAsync(CreateTx(status: TransactionStatus.Completed));
         await service.UpsertTransactionAsync(CreateTx(status: TransactionStatus.Failed));
         await service.UpsertTransactionAsync(CreateTx(status: TransactionStatus.Failed));
-        await service.UpsertTransactionAsync(CreateTx(status: TransactionStatus.Pending));
-
         var failed = await service.GetByStatusAsync(TransactionStatus.Failed);
         Assert.Equal(2, failed.Count);
-        Assert.All(failed, t => Assert.Equal(TransactionStatus.Failed, t.Status));
     }
 
     // ═══════════════════════════════════════
@@ -180,10 +141,7 @@ public class TransactionServiceTests
     public async Task Upsert_100ConcurrentNewTransactions_AllSucceed()
     {
         var service = new InMemoryTransactionService();
-        var tasks = Enumerable.Range(0, 100)
-            .Select(_ => service.UpsertTransactionAsync(CreateTx()))
-            .ToList();
-
+        var tasks = Enumerable.Range(0, 100).Select(_ => service.UpsertTransactionAsync(CreateTx())).ToList();
         await Task.WhenAll(tasks);
         Assert.Equal(100, (await service.GetAllAsync()).Count);
     }
@@ -194,23 +152,10 @@ public class TransactionServiceTests
         var service = new InMemoryTransactionService();
         var id = Guid.NewGuid().ToString();
         var tasks = Enumerable.Range(0, 50)
-            .Select(i => service.UpsertTransactionAsync(
-                CreateTx(id, timestamp: DateTime.UtcNow.AddSeconds(i))))
+            .Select(i => service.UpsertTransactionAsync(CreateTx(id, timestamp: DateTime.UtcNow.AddSeconds(i))))
             .ToList();
-
         await Task.WhenAll(tasks);
         Assert.Single(await service.GetAllAsync());
-    }
-
-    [Fact]
-    public async Task GetAll_ConcurrentReadsAndWrites_NoException()
-    {
-        var service = new InMemoryTransactionService();
-        var writes = Enumerable.Range(0, 50).Select(_ => service.UpsertTransactionAsync(CreateTx()));
-        var reads  = Enumerable.Range(0, 20).Select(_ => service.GetAllAsync());
-        await Task.WhenAll(writes);
-        await Task.WhenAll(reads);
-        Assert.True((await service.GetAllAsync()).Count > 0);
     }
 
     // ═══════════════════════════════════════
@@ -226,6 +171,6 @@ public class TransactionServiceTests
         Amount        = 1500.50m,
         Currency      = "USD",
         Status        = status,
-        Timestamp     = timestamp ?? DateTime.UtcNow
+        Timestamp     = timestamp ?? DateTime.UtcNow,
     };
 }

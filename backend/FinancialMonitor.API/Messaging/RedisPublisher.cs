@@ -1,38 +1,37 @@
-using StackExchange.Redis;
-using System.Text.Json;
+using Microsoft.AspNetCore.SignalR;
+using FinancialMonitor.API.Hubs;
+using FinancialMonitor.API.Interfaces;
 using FinancialMonitor.API.Models;
 
 namespace FinancialMonitor.API.Messaging;
 
-public interface ITransactionPublisher
-{
-    Task PublishAsync(Transaction transaction);
-}
-
 /// <summary>
-/// Redis Pub/Sub — for production with multiple pods.
-/// Publishes to "transactions" channel that all pods listen to.
+/// Production publisher — uses SignalR's built-in Redis backplane.
+///
+/// hubContext.Clients.All.SendAsync(...) looks like a local call,
+/// but with AddStackExchangeRedis() registered, SignalR internally
+/// publishes to Redis so ALL pods receive and forward the message.
+///
+/// No manual Pub/Sub code needed — SignalR handles it entirely.
 /// </summary>
 public class RedisTransactionPublisher : ITransactionPublisher
 {
-    private readonly ISubscriber _subscriber;
-    private const string Channel = "transactions";
+    private readonly IHubContext<TransactionHub> _hubContext;
 
-    public RedisTransactionPublisher(IConnectionMultiplexer redis)
+    public RedisTransactionPublisher(IHubContext<TransactionHub> hubContext)
     {
-        _subscriber = redis.GetSubscriber();
+        _hubContext = hubContext;
     }
 
     public async Task PublishAsync(Transaction transaction)
     {
-        var json = JsonSerializer.Serialize(transaction);
-        await _subscriber.PublishAsync(RedisChannel.Literal(Channel), json);
+        await _hubContext.Clients.All.SendAsync("ReceiveTransaction", transaction);
     }
 }
 
 /// <summary>
-/// Local fallback — when no Redis (single pod only).
-/// Writes to internal Channel that LocalBroadcastService listens to.
+/// Single-pod fallback — no Redis.
+/// Writes to an internal Channel that LocalBroadcastService reads.
 /// </summary>
 public class NoOpTransactionPublisher : ITransactionPublisher
 {

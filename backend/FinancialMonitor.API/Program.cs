@@ -1,5 +1,7 @@
+using FinancialMonitor.API.Apis;
 using FinancialMonitor.API.Data;
 using FinancialMonitor.API.Hubs;
+using FinancialMonitor.API.Interfaces;
 using FinancialMonitor.API.Messaging;
 using FinancialMonitor.API.Services;
 using Microsoft.EntityFrameworkCore;
@@ -7,66 +9,83 @@ using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddControllers()
-    .AddJsonOptions(o =>
-        o.JsonSerializerOptions.Converters.Add(
-            new System.Text.Json.Serialization.JsonStringEnumConverter()));
+// ─── JSON ───────────────────────────────────────────────────────────────────
+builder.Services.ConfigureHttpJsonOptions(o =>
+    o.SerializerOptions.Converters.Add(
+        new System.Text.Json.Serialization.JsonStringEnumConverter()));
 
-builder.Services.AddSignalR();
-
-// ═══════════════════════════════════════════════════════
-// DATABASE
-// Development environment → SQLite  (local file, zero setup)
-// Production environment → PostgreSQL (shared across all pods)
-//
-// Selection is made by DATABASE_PROVIDER environment variable
-// ═══════════════════════════════════════════════════════
-var dbProvider    = builder.Configuration["DATABASE_PROVIDER"] ?? "sqlite";
-var pgConn        = builder.Configuration["ConnectionStrings:PostgreSQL"];
-var sqliteDb      = Path.Combine(builder.Environment.ContentRootPath, "transactions.db");
+// ─── DATABASE ───────────────────────────────────────────────────────────────
+// Dev  → SQLite  (zero setup, file on disk)
+// Prod → PostgreSQL (env var DATABASE_PROVIDER=postgres)
+var dbProvider = builder.Configuration["DATABASE_PROVIDER"] ?? "sqlite";
+var pgConn     = builder.Configuration["ConnectionStrings:PostgreSQL"];
+var sqliteDb   = Path.Combine(builder.Environment.ContentRootPath, "transactions.db");
 
 builder.Services.AddDbContextFactory<AppDbContext>(options =>
 {
     if (dbProvider == "postgres" && !string.IsNullOrWhiteSpace(pgConn))
     {
         options.UseNpgsql(pgConn);
-        Console.WriteLine("[INFO] Database: PostgreSQL (distributed mode)");
+        Console.WriteLine("[INFO] Database: PostgreSQL");
     }
     else
     {
         options.UseSqlite($"Data Source={sqliteDb}");
-        Console.WriteLine("[INFO] Database: SQLite (single-pod mode)");
+        Console.WriteLine("[INFO] Database: SQLite");
     }
 });
 
-// ═══════════════════════════════════════════════════════
-// REDIS — Pub/Sub for WebSocket synchronization between pods
-// Without Redis → local fallback (single pod)
-// ═══════════════════════════════════════════════════════
+// ─── SIGNALR + REDIS BACKPLANE ───────────────────────────────────────────────
+//
+// The distributed problem:
+//   5 pods are running. Client connects to Pod A.
+//   A POST arrives at Pod B → only Pod B's SignalR clients see it.
+//   Pod A's clients are blind.
+//
+// The solution — Redis Backplane:
+//   SignalR built-in backplane support via AddStackExchangeRedis().
+//   When Pod B calls hubContext.Clients.All.SendAsync(...),
+//   SignalR internally publishes to a Redis channel.
+//   All other pods are subscribed to that channel and re-broadcast
+//   to their own connected clients automatically.
+//
+//   Without Redis → single-pod mode (LocalBroadcastService fallback).
+//
 var redisConn = builder.Configuration["Redis:ConnectionString"];
 var hasRedis  = false;
+
+var signalRBuilder = builder.Services.AddSignalR();
 
 if (!string.IsNullOrWhiteSpace(redisConn))
 {
     try
     {
+        // Verify Redis is actually reachable before registering
         var redisCfg = ConfigurationOptions.Parse(redisConn);
         redisCfg.AbortOnConnectFail = true;
         redisCfg.ConnectTimeout     = 3000;
-        redisCfg.SyncTimeout        = 3000;
 
         var redis = await ConnectionMultiplexer.ConnectAsync(redisCfg);
-        await redis.GetDatabase().PingAsync(); // Real connection test
+        await redis.GetDatabase().PingAsync();
+
+        // Register for ITransactionPublisher (still needed to trigger cache update)
         builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
+
+        // This single line replaces our entire RedisSubscriberService.
+        // SignalR handles pub/sub across all pods automatically.
+        signalRBuilder.AddStackExchangeRedis(redisConn, o =>
+        {
+            o.Configuration.AbortOnConnectFail = false;
+        });
+
         builder.Services.AddSingleton<ITransactionPublisher, RedisTransactionPublisher>();
-        builder.Services.AddHostedService<RedisSubscriberService>();
 
         hasRedis = true;
-        Console.WriteLine("[INFO] Redis: connected (distributed WebSocket sync)");
+        Console.WriteLine("[INFO] Redis backplane: connected (multi-pod mode)");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[WARNING] Redis unavailable: {ex.Message} → local fallback");
+        Console.WriteLine($"[WARNING] Redis unavailable: {ex.Message} → single-pod fallback");
         builder.Services.AddSingleton<ITransactionPublisher, NoOpTransactionPublisher>();
         builder.Services.AddHostedService<LocalBroadcastService>();
     }
@@ -78,14 +97,16 @@ else
     builder.Services.AddHostedService<LocalBroadcastService>();
 }
 
-// ═══════════════════════════════════════════════════════
-// SERVICES
-// ═══════════════════════════════════════════════════════
-builder.Services.AddSingleton<ITransactionService, SqliteTransactionService>();
+// ─── SERVICES ───────────────────────────────────────────────────────────────
+builder.Services.AddSingleton<ITransactionService, EfTransactionService>();
 builder.Services.AddSingleton<ITransactionCacheUpdater>(sp =>
     (ITransactionCacheUpdater)sp.GetRequiredService<ITransactionService>());
+
+// ─── OPENAPI / SWAGGER ──────────────────────────────────────────────────────
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
+// ─── CORS ───────────────────────────────────────────────────────────────────
 builder.Services.AddCors(o =>
     o.AddPolicy("AllowFrontend", p =>
         p.WithOrigins("http://localhost:5173", "http://localhost:3000")
@@ -93,7 +114,7 @@ builder.Services.AddCors(o =>
 
 var app = builder.Build();
 
-// Automatic DB creation + migrations
+// Auto-create DB schema on startup
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -104,14 +125,12 @@ app.UseSwagger();
 app.UseSwaggerUI();
 app.UseCors("AllowFrontend");
 app.UseAuthorization();
-app.MapControllers();
+
+// ─── ENDPOINTS ──────────────────────────────────────────────────────────────
+app.MapTransactionsApi();
 app.MapHub<TransactionHub>("/hubs/transactions");
-app.MapGet("/health", () => Results.Ok(new
-{
-    status   = "healthy",
-    database = dbProvider,
-    redis    = hasRedis
-}));
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", database = dbProvider, redis = hasRedis }));
 
 app.Run();
+
 public partial class Program { }

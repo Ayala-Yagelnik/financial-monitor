@@ -1,0 +1,113 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════════════
+# FinancialMonitor — Docker Compose (Production-ready)
+#
+# Replaces K8s for simpler deployments (single server, VPS, small team).
+# K8s makes sense when you need auto-scaling across many nodes.
+# Docker Compose is the right tool for 1–3 server deployments.
+#
+# Start:   docker compose up -d
+# Logs:    docker compose logs -f backend
+# Stop:    docker compose down
+# Reset:   docker compose down -v  (removes volumes/DB!)
+# ═══════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ─── Backend (.NET 9 API + SignalR) ───────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: financial-monitor-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      DATABASE_PROVIDER: postgres
+      ConnectionStrings__PostgreSQL: "Host=postgres;Database=financial_monitor;Username=fm_user;Password=${POSTGRES_PASSWORD}"
+      Redis__ConnectionString: "redis:6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - fm-network
+
+  # ─── Frontend (Nginx serving Vite build) ──────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    container_name: financial-monitor-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    networks:
+      - fm-network
+
+  # ─── PostgreSQL ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: financial-monitor-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: financial_monitor
+      POSTGRES_USER: fm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fm_user -d financial_monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fm-network
+
+  # ─── Redis ─────────────────────────────────────────────────────────────
+  # Role in this project:
+  #   Redis is a Pub/Sub message bus between backend instances.
+  #   When Pod A receives a new transaction via POST, it publishes to Redis.
+  #   All other backend pods (and Pod A itself) receive the message via subscription
+  #   and forward it to their own connected WebSocket (SignalR) clients.
+  #
+  #   Without Redis: only works with a single backend container (single-pod mode).
+  #   With Redis: you can run `docker compose up --scale backend=3` and all instances
+  #   will share the same real-time feed.
+  #
+  #   Redis does NOT store transactions — that's PostgreSQL's job.
+  redis:
+    image: redis:7-alpine
+    container_name: financial-monitor-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - fm-network
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  fm-network:
+    driver: bridge
